@@ -6,6 +6,128 @@ const HttpRequest = std.http.Server.Request;
 const Allocator = std.mem.Allocator;
 const Sha1 = std.crypto.hash.Sha1;
 const ArrayList = std.ArrayList;
+const io = std.io;
+
+pub const Message = struct {
+    content: []const u8,
+    type: MessageType,
+    final: bool,
+};
+
+pub const MessageType = enum {
+    Binary,
+    Text,
+    Ping,
+    Pong,
+};
+
+test {
+    _ = FixedBuffer(69);
+}
+fn FixedBuffer(comptime buffer_size: usize) type {
+    return struct {
+        buffer: [buffer_size]u8 = undefined,
+        begin: usize = 0,
+        limit: usize = 0,
+
+        const Self = @This();
+
+        pub fn load_percentage(self: Self) u8 {
+            return @divFloor(self.end() * 100, buffer_size);
+        }
+
+        pub fn taken(self: *Self) []u8 {
+            return self.buffer[self.begin..self.end()];
+        }
+
+        pub fn free(self: *Self) []u8 {
+            @memset(self.buffer[0..self.begin], undefined);
+            @memset(self.buffer[self.end()..], undefined);
+            return self.buffer[self.end()..];
+        }
+
+        fn end(self: Self) usize {
+            return self.begin + self.limit;
+        }
+
+        pub fn shrink(self: *Self, n: usize) void {
+            std.debug.assert(self.begin + n <= self.end());
+            self.begin += n;
+            self.limit -= n;
+        }
+
+        pub fn grow(self: *Self, n: usize) void {
+            std.debug.assert(self.end() + n <= buffer_size);
+            self.limit += n;
+        }
+
+        pub fn rewind(self: *Self) void {
+            if (self.limit < self.begin) {
+                @memcpy(self.buffer[0..self.limit], self.buffer[self.begin..self.end()]);
+            } else {
+                std.mem.copyForwards(self.buffer[0..self.limit], self.buffer[self.begin..self.end()]);
+            }
+            self.begin = 0;
+        }
+    };
+}
+
+pub fn WebSocket(comptime buffer_size: usize) type {
+    comptime {
+        const minimum_buffer_size = 1 << 6;
+        if (buffer_size < minimum_buffer_size) {
+            @compileError(std.fmt.comptimePrint(
+                "The buffer size for the websocket is too small, minimum is {}.\n" ++
+                    "Be aware that a smaller size may result in extra reads.",
+                .{
+                    minimum_buffer_size,
+                },
+            ));
+        }
+    }
+
+    return struct {
+        is_closed: bool = false,
+        stream: std.net.Stream,
+        buffer: FixedBuffer(buffer_size) = .{},
+
+        const Self = @This();
+
+        pub fn init(stream: std.net.Stream) Self {
+            return .{
+                .stream = stream,
+            };
+        }
+
+        pub fn send(self: Self, comptime opcode: protocol.Opcode, payload: []const u8) !void {
+            switch (opcode) {
+                .Text, .Binary => {
+                    const frame = protocol.Frame.message(opcode, payload);
+                    var buffer: [buffer_size]u8 = undefined;
+                    const encoded_frame = try frame.encode(&buffer);
+                    _ = try self.stream.write(encoded_frame);
+                },
+                else => {
+                    @compileError("Only Text and Binary opcodes are allowed");
+                },
+            }
+        }
+
+        fn recv_raw(self: *Self) !protocol.Frame {
+            {
+                const nread = try self.stream.read(self.buffer.free());
+                self.buffer.grow(nread);
+            }
+            defer self.buffer.shrink(self.buffer.taken().len);
+            return protocol.Frame.decode(self.buffer.taken());
+        }
+
+        pub fn recv(self: *Self) ![]const u8 {
+            const frame = try self.recv_raw();
+            return frame.payload;
+        }
+    };
+}
 
 pub const protocol = struct {
     const Opcode = enum(u4) {
@@ -79,26 +201,30 @@ pub const protocol = struct {
             return @as(usize, self.base.payload_length);
         }
 
-        fn encodedSize(self: Self) usize {
+        pub fn encodedSize(self: Self) usize {
             return self.payloadOffset() + self.base.payload_length;
         }
 
-        pub fn encode(self: Self, allocator: Allocator) ![]u8 {
-            var bytes = try allocator.alloc(u8, self.encodedSize());
+        pub fn encode(self: Self, buffer: []u8) ![]u8 {
+            buffer[0..2].* = self.base.encode();
 
-            @memcpy(bytes[0..2], &self.base.encode());
-
-            var payload = bytes[self.payloadOffset()..(self.payloadOffset() + self.payloadLength())];
+            var payload = buffer[self.payloadOffset()..(self.payloadOffset() + self.payloadLength())];
             @memcpy(payload, self.payload);
 
             if (self.base.mask) {
-                bytes[2..6].* = self.mask_key;
+                buffer[2..6].* = self.mask_key;
                 for (payload, 0..) |*chr, i| {
                     chr.* ^= self.mask_key[@mod(i, 4)];
                 }
             }
 
-            return bytes;
+            return buffer[0..self.encodedSize()];
+        }
+
+        pub fn encodeAlloc(self: Self, allocator: Allocator) ![]u8 {
+            var buffer = try allocator.alloc(u8, self.encodedSize());
+            errdefer allocator.free(buffer);
+            return self.encode(buffer);
         }
 
         pub fn message(comptime opcode: Opcode, payload: []const u8) Frame {
@@ -142,7 +268,7 @@ pub const protocol = struct {
 fn testFrameEncoding(allocator: Allocator, frame: protocol.Frame, bytes: []const u8) void {
     var b = allocator.dupe(u8, bytes) catch unreachable;
     defer allocator.free(b);
-    var obtained: []const u8 = frame.encode(allocator) catch unreachable;
+    var obtained: []const u8 = frame.encodeAlloc(allocator) catch unreachable;
     defer allocator.free(obtained);
     if (!std.mem.eql(u8, obtained, b)) {
         std.debug.print("Unexpected encoding for frame\nExpected: 0x{s} {}\nObtained: 0x{s}\n", .{

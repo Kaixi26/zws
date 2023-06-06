@@ -9,6 +9,7 @@ const ArrayList = std.ArrayList;
 
 const zws = @import("zws.zig");
 const protocol = zws.protocol;
+const WebSocket = zws.WebSocket(4096);
 
 const minimal_http_response_str =
     \\HTTP/1.1 200 OK
@@ -59,35 +60,14 @@ pub fn main() !void {
 
             std.os.nanosleep(1, 0);
 
-            //{
-            //    //var frame = protocol.Frame.message(.Text, "hello");
-            //    var frame = protocol.Frame.control(.Close);
-            //    std.debug.print("sent {}\n", .{frame});
-            //    var encoded_frame = try frame.encode(allocator);
-            //    std.debug.print("0x{s}\n", .{
-            //        std.fmt.fmtSliceHexLower(encoded_frame),
-            //    });
-            //    allocator.free(encoded_frame);
-            //    _ = try conn.stream.write(encoded_frame);
-            //}
+            var ws = WebSocket.init(conn.stream);
+            const hello = "hello world";
+            try ws.send(.Text, hello);
 
-            {
-                //var frame = protocol.Frame.control(.Close);
-                var frame = protocol.Frame.message(.Ping, "world");
-                std.debug.print("sent {}\n", .{frame});
-                var encoded_frame = try frame.encode(allocator);
-                defer allocator.free(encoded_frame);
-                _ = try conn.stream.write(encoded_frame);
-            }
+            while (true) {
+                const resp = try ws.recv();
 
-            {
-                var client_req_buffer: [1024]u8 = undefined;
-                const read = try conn.stream.read(&client_req_buffer);
-                const frame = protocol.Frame.decode(client_req_buffer[0..read]);
-                std.debug.print("0x{s}\n", .{
-                    std.fmt.fmtSliceHexLower(client_req_buffer[0..read]),
-                });
-                std.debug.print("recv {}\n", .{frame});
+                std.debug.print("recv {s}\n", .{resp});
             }
 
             std.os.nanosleep(69, 0);
