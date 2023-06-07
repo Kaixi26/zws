@@ -24,6 +24,7 @@ pub const MessageType = enum {
 test {
     _ = FixedBuffer(69);
 }
+
 fn FixedBuffer(comptime buffer_size: usize) type {
     return struct {
         buffer: [buffer_size]u8 = undefined,
@@ -33,7 +34,7 @@ fn FixedBuffer(comptime buffer_size: usize) type {
         const Self = @This();
 
         pub fn load_percentage(self: Self) u8 {
-            return @divFloor(self.end() * 100, buffer_size);
+            return @intCast(u8, @divFloor(self.end() * 100, buffer_size));
         }
 
         pub fn taken(self: *Self) []u8 {
@@ -65,7 +66,7 @@ fn FixedBuffer(comptime buffer_size: usize) type {
             if (self.limit < self.begin) {
                 @memcpy(self.buffer[0..self.limit], self.buffer[self.begin..self.end()]);
             } else {
-                std.mem.copyForwards(self.buffer[0..self.limit], self.buffer[self.begin..self.end()]);
+                std.mem.copyForwards(u8, self.buffer[0..self.limit], self.buffer[self.begin..self.end()]);
             }
             self.begin = 0;
         }
@@ -91,6 +92,10 @@ pub fn WebSocket(comptime buffer_size: usize) type {
         stream: std.net.Stream,
         buffer: FixedBuffer(buffer_size) = .{},
 
+        base_header: ?protocol.BaseHeader = null,
+        extra_header: ?protocol.ExtraHeader = null,
+        payload_cursor: usize = 0,
+
         const Self = @This();
 
         pub fn init(stream: std.net.Stream) Self {
@@ -113,6 +118,83 @@ pub fn WebSocket(comptime buffer_size: usize) type {
             }
         }
 
+        fn getOrReadBaseHeader(self: *Self) ?protocol.BaseHeader {
+            if (self.base_header) |base_header| {
+                return base_header;
+            } else {
+                if (protocol.BaseHeader.decode(self.buffer.taken())) |base_header| {
+                    self.buffer.shrink(base_header.encodedSize());
+                    self.base_header = base_header;
+                    return base_header;
+                } else {
+                    return null;
+                }
+            }
+        }
+
+        fn getOrReadExtraHeader(self: *Self, base_header: protocol.BaseHeader) ?protocol.ExtraHeader {
+            if (self.extra_header) |extra_header| {
+                return extra_header;
+            } else {
+                if (protocol.ExtraHeader.decode(base_header, self.buffer.taken())) |extra_header| {
+                    self.buffer.shrink(protocol.ExtraHeader.encodedSize(base_header));
+                    self.extra_header = extra_header;
+                    return extra_header;
+                } else {
+                    return null;
+                }
+            }
+        }
+
+        fn missingPayloadLength(self: Self, base_header: protocol.BaseHeader, extra_header: protocol.ExtraHeader) usize {
+            return base_header.payload_length + extra_header.extra_length - self.payload_cursor;
+        }
+
+        fn getOrReadPayload(self: *Self, base_header: protocol.BaseHeader, extra_header: protocol.ExtraHeader) []u8 {
+            const missing_payload_length = self.missingPayloadLength(base_header, extra_header);
+            var taken_buffer = self.buffer.taken();
+            const available_length = if (missing_payload_length <= taken_buffer.len)
+                missing_payload_length
+            else
+                taken_buffer.len;
+
+            var payload = taken_buffer[0..available_length];
+            self.buffer.shrink(payload.len);
+
+            for (payload) |*chr| {
+                chr.* ^= extra_header.mask_key[@mod(self.payload_cursor, 4)];
+                self.payload_cursor += 1;
+            }
+
+            return payload;
+        }
+
+        pub fn recv_raww(self: *Self) ![]u8 {
+            while (true) {
+                blk: {
+                    if (self.buffer.load_percentage() > 50) {
+                        self.buffer.rewind();
+                    }
+                    {
+                        const nread = try self.stream.read(self.buffer.free());
+                        self.buffer.grow(nread);
+                    }
+
+                    const base_header = self.getOrReadBaseHeader() orelse break :blk;
+                    const extra_header = self.getOrReadExtraHeader(base_header) orelse break :blk;
+                    const payload = self.getOrReadPayload(base_header, extra_header);
+
+                    if (self.missingPayloadLength(base_header, extra_header) == 0) {
+                        self.base_header = null;
+                        self.extra_header = null;
+                        self.payload_cursor = 0;
+                    }
+
+                    return payload;
+                }
+            }
+        }
+
         fn recv_raw(self: *Self) !protocol.Frame {
             {
                 const nread = try self.stream.read(self.buffer.free());
@@ -123,8 +205,9 @@ pub fn WebSocket(comptime buffer_size: usize) type {
         }
 
         pub fn recv(self: *Self) ![]const u8 {
-            const frame = try self.recv_raw();
-            return frame.payload;
+            return try self.recv_raww();
+            //const frame = try self.recv_raww();
+            //return frame.payload;
         }
     };
 }
@@ -137,6 +220,61 @@ pub const protocol = struct {
         Close = 0x8,
         Ping = 0x9,
         Pong = 0xA,
+    };
+
+    const BaseHeader = packed struct {
+        opcode: Opcode,
+        rsv: u3 = 0,
+        fin: bool = true,
+
+        payload_length: u7 = 0,
+        mask: bool = false,
+
+        const Self = @This();
+
+        pub fn encode(self: Self) [2]u8 {
+            return @bitCast([2]u8, self);
+        }
+
+        pub fn decode(bytes: []u8) ?Self {
+            if (bytes.len >= @sizeOf(@This())) {
+                return @bitCast(Self, bytes[0..2].*);
+            } else {
+                return null;
+            }
+        }
+
+        pub fn encodedSize(self: Self) usize {
+            _ = self;
+            return @sizeOf(@This());
+        }
+
+        comptime {
+            std.debug.assert(@mod(@bitSizeOf(@This()), 16) == 0);
+        }
+    };
+
+    const ExtraHeader = struct {
+        mask_key: [4]u8 = [_]u8{0} ** 4,
+        extra_length: usize = 0,
+
+        const Self = @This();
+
+        pub fn decode(base_header: BaseHeader, bytes: []u8) ?Self {
+            if (bytes.len >= encodedSize(base_header)) {
+                if (base_header.mask) {
+                    return .{ .mask_key = bytes[0..4].* };
+                } else {
+                    return .{};
+                }
+            } else {
+                return null;
+            }
+        }
+
+        pub fn encodedSize(base_header: BaseHeader) usize {
+            return if (base_header.mask) 4 else 0;
+        }
     };
 
     const BaseFrame = packed struct {
