@@ -37,6 +37,10 @@ fn FixedBuffer(comptime buffer_size: usize) type {
             return @intCast(u8, @divFloor(self.end() * 100, buffer_size));
         }
 
+        pub fn taken_const(self: Self) []const u8 {
+            return self.buffer[self.begin..self.end()];
+        }
+
         pub fn taken(self: *Self) []u8 {
             return self.buffer[self.begin..self.end()];
         }
@@ -70,12 +74,20 @@ fn FixedBuffer(comptime buffer_size: usize) type {
             }
             self.begin = 0;
         }
+
+        pub fn format(self: Self, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) std.os.WriteError!void {
+            try writer.print("FixedBuffer{{ [0 - {}][ ", .{self.begin});
+
+            try writer.print("{s}", .{std.fmt.fmtSliceHexLower(self.taken_const())});
+
+            try writer.print("][{} - {}] }}", .{ self.end(), buffer_size });
+        }
     };
 }
 
 pub fn WebSocket(comptime buffer_size: usize) type {
     comptime {
-        const minimum_buffer_size = 1 << 6;
+        const minimum_buffer_size = 1 << 5;
         if (buffer_size < minimum_buffer_size) {
             @compileError(std.fmt.comptimePrint(
                 "The buffer size for the websocket is too small, minimum is {}.\n" ++
@@ -146,12 +158,12 @@ pub fn WebSocket(comptime buffer_size: usize) type {
             }
         }
 
-        fn missingPayloadLength(self: Self, base_header: protocol.BaseHeader, extra_header: protocol.ExtraHeader) usize {
-            return base_header.payload_length + extra_header.extra_length - self.payload_cursor;
+        fn missingPayloadLength(self: Self, extra_header: protocol.ExtraHeader) usize {
+            return extra_header.payload_length - self.payload_cursor;
         }
 
-        fn getOrReadPayload(self: *Self, base_header: protocol.BaseHeader, extra_header: protocol.ExtraHeader) []u8 {
-            const missing_payload_length = self.missingPayloadLength(base_header, extra_header);
+        fn getOrReadPayload(self: *Self, extra_header: protocol.ExtraHeader) []u8 {
+            const missing_payload_length = self.missingPayloadLength(extra_header);
             var taken_buffer = self.buffer.taken();
             const available_length = if (missing_payload_length <= taken_buffer.len)
                 missing_payload_length
@@ -182,9 +194,9 @@ pub fn WebSocket(comptime buffer_size: usize) type {
 
                     const base_header = self.getOrReadBaseHeader() orelse break :blk;
                     const extra_header = self.getOrReadExtraHeader(base_header) orelse break :blk;
-                    const payload = self.getOrReadPayload(base_header, extra_header);
+                    const payload = self.getOrReadPayload(extra_header);
 
-                    if (self.missingPayloadLength(base_header, extra_header) == 0) {
+                    if (self.missingPayloadLength(extra_header) == 0) {
                         self.base_header = null;
                         self.extra_header = null;
                         self.payload_cursor = 0;
@@ -255,25 +267,51 @@ pub const protocol = struct {
     };
 
     const ExtraHeader = struct {
-        mask_key: [4]u8 = [_]u8{0} ** 4,
-        extra_length: usize = 0,
+        mask_key: [4]u8,
+        payload_length: usize,
 
         const Self = @This();
 
         pub fn decode(base_header: BaseHeader, bytes: []u8) ?Self {
             if (bytes.len >= encodedSize(base_header)) {
+                var sliding_bytes = bytes;
+
+                const payload_length: usize = blk: {
+                    switch (base_header.payload_length) {
+                        126 => {
+                            defer sliding_bytes = sliding_bytes[2..];
+                            break :blk @byteSwap(@bitCast(u16, bytes[0..2].*));
+                        },
+                        127 => {
+                            defer sliding_bytes = sliding_bytes[8..];
+                            break :blk @byteSwap(@bitCast(u64, sliding_bytes[0..8].*));
+                        },
+                        else => |length| break :blk length,
+                    }
+                };
+
+                var mask_key: [4]u8 = [_]u8{0} ** 4;
                 if (base_header.mask) {
-                    return .{ .mask_key = bytes[0..4].* };
-                } else {
-                    return .{};
+                    mask_key = sliding_bytes[0..4].*;
                 }
+
+                return .{ .mask_key = mask_key, .payload_length = payload_length };
             } else {
                 return null;
             }
         }
 
         pub fn encodedSize(base_header: BaseHeader) usize {
-            return if (base_header.mask) 4 else 0;
+            var size: usize = 0;
+            if (base_header.mask) {
+                size += 4;
+            }
+            switch (base_header.payload_length) {
+                126 => size += 2,
+                127 => size += 8,
+                else => {},
+            }
+            return size;
         }
     };
 
@@ -282,7 +320,7 @@ pub const protocol = struct {
         rsv: u3 = 0,
         fin: bool = true,
 
-        payload_length: u7 = 0, // TODO: bigger payloads
+        payload_length: u7 = 0,
         mask: bool = false,
 
         const Self = @This();

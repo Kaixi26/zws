@@ -9,7 +9,7 @@ const ArrayList = std.ArrayList;
 
 const zws = @import("zws.zig");
 const protocol = zws.protocol;
-const WebSocket = zws.WebSocket(69);
+const WebSocket = zws.WebSocket(4096);
 
 const minimal_http_response_str =
     \\HTTP/1.1 200 OK
